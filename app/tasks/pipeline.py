@@ -36,7 +36,7 @@ def _get_sync_db():
 
 
 @celery_app.task(bind=True, name="app.tasks.pipeline.task_generate_grids", max_retries=3)
-def task_generate_grids(self, city: str, grid_size_km: float = None):
+def task_generate_grids(self, city: str, grid_size_km: float = None, country: str = None):
     """
     Stage 1: Generate grid coordinates for a city.
     Returns list of grid points.
@@ -44,7 +44,7 @@ def task_generate_grids(self, city: str, grid_size_km: float = None):
     from app.modules.grid_generator import generate_city_grid
 
     try:
-        grid_points = _run_async(generate_city_grid(city, grid_size_km))
+        grid_points = _run_async(generate_city_grid(city, grid_size_km, country=country))
         logger.info("Generated %d grid points for city '%s'", len(grid_points), city)
         return {"city": city, "grid_points": grid_points, "count": len(grid_points)}
     except Exception as exc:
@@ -66,7 +66,7 @@ def task_expand_keywords(self, keywords: list[str]):
 
 
 @celery_app.task(bind=True, name="app.tasks.pipeline.task_search_maps", max_retries=3)
-def task_search_maps(self, keyword: str, lat: float, lng: float, city: str):
+def task_search_maps(self, keyword: str, lat: float, lng: float, city: str, country: str = None):
     """
     Stage 3: Search Google Maps for businesses at a grid point.
     Stores discovered businesses in MongoDB.
@@ -87,6 +87,8 @@ def task_search_maps(self, keyword: str, lat: float, lng: float, city: str):
         biz["city"] = city
         biz["category"] = keyword
         biz["scraped_at"] = datetime.now(timezone.utc)
+        if country:
+            biz["country"] = country.upper()
 
         # Upsert by place_id
         db.businesses.update_one(
@@ -225,49 +227,52 @@ def task_crawl_website(self, place_id: str, website_url: str):
 
 
 @celery_app.task(name="app.tasks.pipeline.task_orchestrate_search")
-def task_orchestrate_search(city: str, keywords: list[str]):
+def task_orchestrate_search(cities: list[str], keywords: list[str], country: str = None):
     """
-    Master orchestrator: kicks off the full pipeline for a city + keywords.
-    1. Generate grids
+    Master orchestrator: kicks off the full pipeline for multiple cities + keywords.
+    1. Generate grids for each city
     2. Expand keywords
-    3. For each keyword × grid point → search maps
-    4. For each business → fetch details
-    5. For each business with website → crawl + extract emails
+    3. For each city × keyword × grid point → search maps
     """
-    from celery import chain, group, chord
+    from celery import group
 
-    # Step 1: Generate grids
-    grid_result = task_generate_grids.apply(args=[city])
-    grid_data = grid_result.get(timeout=120)
-    grid_points = grid_data["grid_points"]
-
-    # Step 2: Expand keywords
+    # Step 1: Expand keywords
     kw_result = task_expand_keywords.apply(args=[keywords])
     kw_data = kw_result.get(timeout=30)
     expanded_keywords = kw_data["keywords"]
 
-    # Step 3: Search maps — dispatch all keyword × grid combinations
-    search_tasks = []
-    for kw in expanded_keywords:
-        for point in grid_points:
-            search_tasks.append(
-                task_search_maps.s(kw, point["lat"], point["lng"], city)
-            )
-
-    # Execute search tasks in batches
-    batch_size = 50
     all_place_ids = set()
 
-    for i in range(0, len(search_tasks), batch_size):
-        batch = group(search_tasks[i:i + batch_size])
-        results = batch.apply_async()
-        for result in results.get(timeout=600):
-            if isinstance(result, dict) and "place_ids" in result:
-                all_place_ids.update(result["place_ids"])
+    # Step 2: Process each city
+    for city in cities:
+        logger.info("Processing city: %s (country=%s)", city, country)
 
-    logger.info("Total unique businesses found: %d", len(all_place_ids))
+        # Generate grids for this city
+        grid_result = task_generate_grids.apply(args=[city], kwargs={"country": country})
+        grid_data = grid_result.get(timeout=120)
+        grid_points = grid_data["grid_points"]
+
+        # Step 3: Search maps — dispatch all keyword × grid combinations
+        search_tasks = []
+        for kw in expanded_keywords:
+            for point in grid_points:
+                search_tasks.append(
+                    task_search_maps.s(kw, point["lat"], point["lng"], city, country)
+                )
+
+        # Execute search tasks in batches
+        batch_size = 50
+        for i in range(0, len(search_tasks), batch_size):
+            batch = group(search_tasks[i:i + batch_size])
+            results = batch.apply_async()
+            for result in results.get(timeout=600):
+                if isinstance(result, dict) and "place_ids" in result:
+                    all_place_ids.update(result["place_ids"])
+
+    logger.info("Total unique businesses found across %d cities: %d", len(cities), len(all_place_ids))
     return {
-        "city": city,
+        "cities": cities,
+        "country": country,
         "total_businesses": len(all_place_ids),
         "place_ids": list(all_place_ids),
     }
@@ -277,9 +282,8 @@ def task_orchestrate_search(city: str, keywords: list[str]):
 def task_orchestrate_scraping(city: str = None, limit: int = 1000):
     """
     Master orchestrator for the scraping pipeline:
-    1. Fetch details for businesses without website info
-    2. Discover websites for businesses without websites
-    3. Crawl websites and extract emails
+    1. Discover websites for businesses without websites (Free Fallback)
+    2. Crawl websites and extract emails
     """
     from celery import group
 
@@ -292,22 +296,8 @@ def task_orchestrate_scraping(city: str = None, limit: int = 1000):
 
     businesses = list(db.businesses.find(query).limit(limit))
 
-    # Step 1: Fetch details for businesses missing website
-    detail_tasks = []
-    for biz in businesses:
-        if not biz.get("website") and not biz.get("phone"):
-            detail_tasks.append(task_fetch_details.s(biz["place_id"]))
+    # Step 1: Discover websites for those missing
 
-    if detail_tasks:
-        batch_size = 50
-        for i in range(0, len(detail_tasks), batch_size):
-            batch = group(detail_tasks[i:i + batch_size])
-            batch.apply_async().get(timeout=600)
-
-    # Refresh business data
-    businesses = list(db.businesses.find(query).limit(limit))
-
-    # Step 2: Discover websites for those still missing
     discovery_tasks = []
     for biz in businesses:
         if not biz.get("website"):
@@ -328,7 +318,7 @@ def task_orchestrate_scraping(city: str = None, limit: int = 1000):
     # Refresh again
     businesses = list(db.businesses.find(query).limit(limit))
 
-    # Step 3: Crawl websites and extract emails
+    # Step 2: Crawl websites and extract emails
     crawl_tasks = []
     for biz in businesses:
         if biz.get("website"):

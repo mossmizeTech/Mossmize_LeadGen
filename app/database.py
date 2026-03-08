@@ -20,6 +20,7 @@ async def connect_db() -> None:
     await _db.businesses.create_index("place_id", unique=True)
     await _db.businesses.create_index("website")
     await _db.businesses.create_index("city")
+    await _db.businesses.create_index("country")
     await _db.emails.create_index("email")
     await _db.emails.create_index("business_id")
     await _db.emails.create_index([("email", 1), ("business_id", 1)], unique=True)

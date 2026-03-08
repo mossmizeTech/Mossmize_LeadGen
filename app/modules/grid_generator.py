@@ -9,15 +9,23 @@ import httpx
 from app.config import settings
 
 
-async def geocode_city(city: str) -> dict:
+async def geocode_city(city: str, country: str | None = None) -> dict:
     """
     Use Google Geocoding API to get city bounds and center coordinates.
+
+    Args:
+        city: city name (e.g. "London, UK" or "Dubai, UAE")
+        country: optional ISO country code to improve geocoding accuracy
 
     Returns:
         dict with keys: lat, lng, northeast, southwest (bounding box)
     """
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {"address": city, "key": settings.google_maps_api_key}
+
+    # Add country component bias for more accurate results
+    if country:
+        params["components"] = f"country:{country}"
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(url, params=params)
@@ -92,17 +100,23 @@ def create_grid(
     return grid_points
 
 
-async def generate_city_grid(city: str, grid_size_km: float | None = None) -> list[dict]:
+async def generate_city_grid(
+    city: str,
+    grid_size_km: float | None = None,
+    country: str | None = None,
+) -> list[dict]:
     """
     High-level function: geocode a city and return grid center points.
 
     Args:
-        city: city name (e.g. "Delhi")
+        city: city name (e.g. "London, UK" or "Dubai, UAE")
         grid_size_km: optional tile size override
+        country: optional ISO country code (e.g. "US", "GB", "AE")
 
     Returns:
         List of {"lat": float, "lng": float} dicts
     """
-    geo = await geocode_city(city)
+    geo = await geocode_city(city, country=country)
     grid = create_grid(geo["northeast"], geo["southwest"], grid_size_km)
     return grid
+

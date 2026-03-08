@@ -11,12 +11,24 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Domains to exclude from search results
+# Domains to exclude from search results (global directory & social sites)
 EXCLUDED_DOMAINS = {
+    # Social media
     "facebook.com", "instagram.com", "twitter.com", "x.com",
     "linkedin.com", "youtube.com", "tiktok.com", "pinterest.com",
-    "yelp.com", "tripadvisor.com", "justdial.com", "indiamart.com",
+    # Global directories & review sites
+    "yelp.com", "yelp.co.uk", "yelp.de", "yelp.fr",
+    "tripadvisor.com", "tripadvisor.co.uk",
+    "yellowpages.com", "yellowpages.ca", "yellowpages.com.au",
+    "bbb.org", "trustpilot.com", "glassdoor.com",
+    "foursquare.com", "zomato.com", "opentable.com",
+    # Regional directories
+    "yell.com", "pagesjaunes.fr", "gelbeseiten.de",
+    "paginegialle.it", "gouden-gids.be",
+    "hotfrog.com", "cylex.com", "kompass.com",
+    # Google & reference
     "google.com", "wikipedia.org", "maps.google.com",
+    "apple.com", "bing.com",
 }
 
 

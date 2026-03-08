@@ -18,6 +18,11 @@ from app.tasks.pipeline import (
     task_orchestrate_search,
     task_orchestrate_scraping,
 )
+from app.modules.regions import (
+    get_all_supported_countries,
+    resolve_cities,
+    REGION_GROUPS,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -27,8 +32,10 @@ router = APIRouter()
 
 class SearchRequest(BaseModel):
     """Request body for starting a search."""
-    city: str
+    city: Optional[str] = None
     keywords: list[str]
+    country: Optional[str] = None
+    region: Optional[str] = None
     grid_size_km: Optional[float] = None
 
 
@@ -56,19 +63,35 @@ class ScrapeResponse(BaseModel):
 async def start_search(req: SearchRequest):
     """
     Start a new Google Maps search job.
-    Generates grid, expands keywords, searches all grid×keyword combinations.
+    Provide city, country code, or region to target specific areas.
+
+    Examples:
+        {"city": "London, UK", "keywords": ["dentist"]}
+        {"country": "US", "keywords": ["restaurant"]}
+        {"region": "gulf", "keywords": ["marketing agency"]}
     """
-    if not req.city.strip():
-        raise HTTPException(status_code=400, detail="City is required")
     if not req.keywords:
         raise HTTPException(status_code=400, detail="At least one keyword is required")
 
-    task = task_orchestrate_search.delay(req.city.strip(), req.keywords)
+    # Resolve cities from city/country/region
+    cities = resolve_cities(city=req.city, country=req.country, region=req.region)
+    if not cities:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide at least one of: city, country (ISO code), or region"
+        )
 
+    task = task_orchestrate_search.delay(
+        cities=cities,
+        keywords=req.keywords,
+        country=req.country,
+    )
+
+    city_label = req.city or req.country or req.region or "multiple"
     return SearchResponse(
         task_id=task.id,
-        message=f"Search started for '{req.city}' with {len(req.keywords)} keywords",
-        city=req.city,
+        message=f"Search started for '{city_label}' ({len(cities)} cities) with {len(req.keywords)} keywords",
+        city=city_label,
         keywords=req.keywords,
     )
 
@@ -86,9 +109,21 @@ async def start_scraping(req: ScrapeRequest):
     )
 
 
+@router.get("/regions")
+async def get_regions():
+    """
+    List all supported countries and region groups for search targeting.
+    """
+    return {
+        "countries": get_all_supported_countries(),
+        "region_groups": {k: v for k, v in REGION_GROUPS.items()},
+    }
+
+
 @router.get("/leads")
 async def get_leads(
     city: Optional[str] = Query(None, description="Filter by city"),
+    country: Optional[str] = Query(None, description="Filter by country code"),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(50, ge=1, le=500, description="Items per page"),
     has_email: Optional[bool] = Query(None, description="Filter businesses with/without emails"),
@@ -103,6 +138,8 @@ async def get_leads(
     query = {}
     if city:
         query["city"] = {"$regex": city, "$options": "i"}
+    if country:
+        query["country"] = country.upper()
 
     # Get businesses
     cursor = db.businesses.find(query).skip(skip).limit(page_size).sort("scraped_at", -1)
@@ -125,6 +162,7 @@ async def get_leads(
             "website": biz.get("website"),
             "phone": biz.get("phone"),
             "city": biz.get("city", ""),
+            "country": biz.get("country", ""),
             "category": biz.get("category"),
             "rating": biz.get("rating"),
             "latitude": biz.get("latitude"),
@@ -150,21 +188,31 @@ async def get_leads(
 
 
 @router.get("/stats")
-async def get_stats():
+async def get_stats(
+    city: Optional[str] = Query(None, description="Filter by city"),
+    country: Optional[str] = Query(None, description="Filter by country code"),
+):
     """
     Get summary statistics of the lead database.
     """
     db = get_db()
 
-    total_businesses = await db.businesses.count_documents({})
-    total_emails = await db.emails.count_documents({})
-    validated_emails = await db.emails.count_documents({"validated": True})
+    query = {}
+    if city:
+        query["city"] = {"$regex": city, "$options": "i"}
+    if country:
+        query["country"] = country.upper()
+
+    total_businesses = await db.businesses.count_documents(query)
+    total_emails = await db.emails.count_documents({"business_id": {"$in": [b["_id"] for b in await db.businesses.find(query, {"_id": 1}).to_list(length=None)]}})
+    validated_emails = await db.emails.count_documents({"business_id": {"$in": [b["_id"] for b in await db.businesses.find(query, {"_id": 1}).to_list(length=None)]}, "validated": True})
 
     # Businesses with websites
-    with_website = await db.businesses.count_documents({"website": {"$ne": None, "$exists": True}})
+    with_website = await db.businesses.count_documents({**query, "website": {"$ne": None, "$exists": True}})
 
     # Stats per city
     pipeline = [
+        {"$match": query}, # Apply initial filter
         {"$group": {
             "_id": "$city",
             "count": {"$sum": 1},
@@ -193,6 +241,7 @@ async def get_stats():
 async def export_leads(
     format: str = Query("csv", description="Export format: csv or json"),
     city: Optional[str] = Query(None, description="Filter by city"),
+    country: Optional[str] = Query(None, description="Filter by country code"),
 ):
     """
     Export leads as CSV or JSON.
@@ -202,6 +251,8 @@ async def export_leads(
     query = {}
     if city:
         query["city"] = {"$regex": city, "$options": "i"}
+    if country:
+        query["country"] = country.upper()
 
     cursor = db.businesses.find(query).sort("scraped_at", -1)
     businesses = await cursor.to_list(length=100000)
@@ -220,6 +271,7 @@ async def export_leads(
             "website": biz.get("website", ""),
             "phone": biz.get("phone", ""),
             "city": biz.get("city", ""),
+            "country": biz.get("country", ""),
             "address": biz.get("address", ""),
             "category": biz.get("category", ""),
             "rating": biz.get("rating", ""),
